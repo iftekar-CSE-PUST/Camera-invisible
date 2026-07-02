@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Air Gesture Invisibility Camera - Clean</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+    }
+
+    #container {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    #video {
+      display: none;
+    }
+
+    #canvas {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+      background: #000;
+    }
+
+    #ui-overlay,
+    #countdown-overlay,
+    #error-overlay,
+    #gesture-status,
+    #instructions,
+    #controls,
+    header,
+    h1,
+    button,
+    select,
+    #status-badge,
+    .panel {
+      display: none !important;
+    }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
+
+    <!-- Hidden UI kept for script compatibility only -->
+    <div id="countdown-overlay" class="interactive hide">
+      <div id="countdown-card" class="panel">
+        <div>ক্যামেরার সামনে থেকে সরে দাঁড়ান</div>
+        <div>ফাঁকা ব্যাকগ্রাউন্ড অটো-সেভ হবে</div>
+        <div id="timer-count">5</div>
+        <button id="skip-timer-btn">Skip / Manual Capture</button>
+      </div>
+    </div>
+
+    <div id="error-overlay" class="interactive hide">
+      <div id="error-card" class="panel">
+        <h2>ক্যামেরা চালু হয়নি</h2>
+        <p id="error-text">Camera access পাওয়া যায়নি।</p>
+        <ul id="error-list">
+          <li>OBS Browser Source হলে Local File এর বদলে http://localhost URL ব্যবহার করুন</li>
+          <li>OBS চালুর সময় --use-fake-ui-for-media-stream flag ব্যবহার করুন</li>
+          <li>Windows/Mac privacy settings থেকে OBS-কে Camera permission দিন</li>
+          <li>অথবা ফাইলটি Chrome-এ খুলে Window Capture দিয়ে OBS-এ নিন</li>
+        </ul>
+        <div>
+          <button id="retry-btn">আবার চেষ্টা করুন</button>
+          <button id="dismiss-error-btn">বন্ধ করুন</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="ui-overlay">
+      <header class="interactive">
+        <h1>AI Air Gesture Invisibility Cam</h1>
+        <div id="top-tools">
+          <select id="camera-select" title="Camera source">
+            <option value="">Default Camera</option>
+          </select>
+          <button id="start-camera-btn">Start Camera</button>
+          <div id="status-badge">Visible (Live)</div>
+        </div>
+      </header>
+
+      <div id="gesture-status">2-Finger Gesture Detected!</div>
+
+      <div id="instructions" class="interactive panel hide">
+        <h2>Peace Sign Gesture</h2>
+        <p>Peace sign দিলে Invisible mode চালু/বন্ধ হবে।</p>
+        <button id="got-it-btn">শুরু করুন</button>
+      </div>
+
+      <div id="controls" class="interactive">
+        <button id="recapture-bg-btn">Re-Capture Background</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+    const statusBadge = document.getElementById('status-badge');
+    const recaptureBgBtn = document.getElementById('recapture-bg-btn');
+    const gotItBtn = document.getElementById('got-it-btn');
+    const instructions = document.getElementById('instructions');
+    const countdownOverlay = document.getElementById('countdown-overlay');
+    const timerCount = document.getElementById('timer-count');
+    const skipTimerBtn = document.getElementById('skip-timer-btn');
+    const gestureStatus = document.getElementById('gesture-status');
+    const cameraSelect = document.getElementById('camera-select');
+    const startCameraBtn = document.getElementById('start-camera-btn');
+    const errorOverlay = document.getElementById('error-overlay');
+    const errorText = document.getElementById('error-text');
+    const retryBtn = document.getElementById('retry-btn');
+    const dismissErrorBtn = document.getElementById('dismiss-error-btn');
+
+    let isInvisible = false;
+    let backgroundFrame = null;
+    let isGesturing = false;
+    let lastVideoWidth = 1280;
+    let lastVideoHeight = 720;
+    let mediaStream = null;
+    let processLoopRunning = false;
+    let handSendBusy = false;
+    let autoCaptured = false;
+
+    function showGestureFeedback(text) {
+      gestureStatus.textContent = text;
+    }
+
+    function setStatusVisible() {
+      statusBadge.textContent = 'Visible (Live)';
+      statusBadge.classList.remove('invisible-active');
+    }
+
+    function setStatusInvisible() {
+      statusBadge.textContent = 'Invisible (Active)';
+      statusBadge.classList.add('invisible-active');
+    }
+
+    function showError(message) {
+      errorText.textContent = message;
+      errorOverlay.classList.remove('hide');
+    }
+
+    function hideError() {
+      errorOverlay.classList.add('hide');
+    }
+
+    function fitCanvasToVideo() {
+      if (video.videoWidth && video.videoHeight) {
+        lastVideoWidth = video.videoWidth;
+        lastVideoHeight = video.videoHeight;
+      }
+      canvas.width = lastVideoWidth;
+      canvas.height = lastVideoHeight;
+    }
+
+    function captureBackground() {
+      if (!video.videoWidth || !video.videoHeight) {
+        return false;
+      }
+      fitCanvasToVideo();
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      backgroundFrame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      return true;
+    }
+
+    function toggleInvisibility() {
+      if (!backgroundFrame) {
+        captureBackground();
+      }
+      isInvisible = !isInvisible;
+      if (isInvisible) setStatusInvisible();
+      else setStatusVisible();
+    }
+
+    function isPeaceSign(landmarks) {
+      const indexTip = landmarks[8];
+      const indexPip = landmarks[6];
+      const middleTip = landmarks[12];
+      const middlePip = landmarks[10];
+      const ringTip = landmarks[16];
+      const ringPip = landmarks[14];
+      const pinkyTip = landmarks[20];
+      const pinkyPip = landmarks[18];
+      const thumbTip = landmarks[4];
+      const thumbIp = landmarks[3];
+      const thumbMcp = landmarks[2];
+
+      // Index and middle fingers extended upward
+      const indexUp = indexTip.y < indexPip.y;
+      const middleUp = middleTip.y < middlePip.y;
+
+      // Ring and pinky fingers folded down
+      const ringDown = ringTip.y > ringPip.y;
+      const pinkyDown = pinkyTip.y > pinkyPip.y;
+
+      // Thumb folded (not extended)
+      const thumbFolded = thumbTip.y > thumbIp.y || thumbTip.y > thumbMcp.y ||
+                           Math.abs(thumbTip.x - thumbMcp.x) < 0.05;
+
+      // Index and middle tips should be spread apart for a real V sign
+      const spread = Math.hypot(indexTip.x - middleTip.x, indexTip.y - middleTip.y);
+      const spreadEnough = spread > 0.035;
+
+      return indexUp && middleUp && ringDown && pinkyDown && thumbFolded && spreadEnough;
+    }
+
+    gotItBtn.addEventListener('click', () => {
+      instructions.classList.add('hide');
+    });
+
+    recaptureBgBtn.addEventListener('click', () => {
+      captureBackground();
+    });
+
+    retryBtn.addEventListener('click', () => {
+      hideError();
+      startCamera(cameraSelect.value || undefined);
+    });
+
+    dismissErrorBtn.addEventListener('click', hideError);
+
+    async function populateCameraList() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoInputs = devices.filter(d => d.kind === 'videoinput');
+        const currentValue = cameraSelect.value;
+        cameraSelect.innerHTML = '<option value="">Default Camera</option>';
+        videoInputs.forEach((device, index) => {
+          const opt = document.createElement('option');
+          opt.value = device.deviceId;
+          opt.textContent = device.label || `Camera ${index + 1}`;
+          cameraSelect.appendChild(opt);
+        });
+        if ([...cameraSelect.options].some(o => o.value === currentValue)) {
+          cameraSelect.value = currentValue;
+        }
+      } catch (err) {
+        console.warn('Could not enumerate cameras', err);
+      }
+    }
+
+    async function stopCurrentStream() {
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+      }
+      video.srcObject = null;
+    }
+
+    async function startCamera(deviceId) {
+      try {
+        hideError();
+
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          showError('এই পরিবেশে getUserMedia / camera API পাওয়া যাচ্ছে না।');
+          return;
+        }
+
+        await stopCurrentStream();
+
+        const videoConstraints = deviceId
+          ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+          : { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' };
+
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          video: videoConstraints,
+          audio: false
+        });
+
+        video.srcObject = mediaStream;
+        await video.play();
+        fitCanvasToVideo();
+        await populateCameraList();
+        if (deviceId) cameraSelect.value = deviceId;
+        setStatusVisible();
+
+        if (!processLoopRunning) {
+          processLoopRunning = true;
+          processFrames();
+        }
+      } catch (err) {
+        console.error(err);
+        const name = err && err.name ? err.name : 'Error';
+        let message = 'Camera access পাওয়া যায়নি।';
+        if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+          message = 'Camera permission denied হয়েছে।';
+        } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+          message = 'কোনো camera device পাওয়া যায়নি।';
+        } else if (name === 'NotReadableError' || name === 'TrackStartError') {
+          message = 'Camera অন্য app/OBS source already ব্যবহার করছে।';
+        } else if (name === 'OverconstrainedError') {
+          message = 'নির্বাচিত camera source start করা যায়নি। অন্য camera নির্বাচন করুন।';
+        }
+        showError(message);
+      }
+    }
+
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.7,
+      minTrackingConfidence: 0.7
+    });
+
+    hands.onResults((results) => {
+      if (results.image) {
+        canvas.width = results.image.width;
+        canvas.height = results.image.height;
+        lastVideoWidth = canvas.width;
+        lastVideoHeight = canvas.height;
+      }
+
+      if (isInvisible && backgroundFrame) {
+        ctx.putImageData(backgroundFrame, 0, 0);
+      } else if (results.image) {
+        ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+      }
+
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        const landmarks = results.multiHandLandmarks[0];
+
+        if (isPeaceSign(landmarks)) {
+          if (!isGesturing) {
+            isGesturing = true;
+            showGestureFeedback('Peace sign detected');
+            toggleInvisibility();
+            setTimeout(() => {
+              isGesturing = false;
+            }, 1500);
+          }
+        }
+      }
+    });
+
+    async function processFrames() {
+      if (video.readyState >= 2 && !handSendBusy) {
+        try {
+          handSendBusy = true;
+          await hands.send({ image: video });
+        } catch (err) {
+          console.error('MediaPipe processing error:', err);
+        } finally {
+          handSendBusy = false;
+        }
+      }
+      requestAnimationFrame(processFrames);
+    }
+
+    startCameraBtn.addEventListener('click', () => {
+      startCamera(cameraSelect.value || undefined);
+    });
+
+    cameraSelect.addEventListener('change', () => {
+      startCamera(cameraSelect.value || undefined);
+    });
+
+    // Space key captures / re-captures the background
+    document.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') {
+        e.preventDefault();
+        captureBackground();
+      }
+    });
+
+    // Auto-capture background once shortly after camera starts (silent, no UI)
+    video.addEventListener('playing', () => {
+      if (!autoCaptured) {
+        autoCaptured = true;
+        setTimeout(() => {
+          captureBackground();
+        }, 1500);
+      }
+    });
+
+    if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+      navigator.mediaDevices.addEventListener('devicechange', populateCameraList);
+    }
+
+    populateCameraList().then(() => startCamera());
+  </script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"1954b47c125f43f8b4338b3c4f804e4f","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+</body>
+</html>
