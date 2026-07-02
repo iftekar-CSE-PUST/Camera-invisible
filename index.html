@@ -133,16 +133,15 @@
 
     let isInvisible = false;
     let backgroundFrame = null;
+    let isGesturing = false;
     let lastVideoWidth = 1280;
     let lastVideoHeight = 720;
     let mediaStream = null;
     let processLoopRunning = false;
     let handSendBusy = false;
     let autoCaptured = false;
-    let peaceFrames = 0;
-    const PEACE_HOLD_FRAMES = 12; // ~400ms at 30fps
-    let peaceSignActive = false;
-    let peaceSignTriggered = false;
+    let peaceFrameCount = 0;
+    const PEACE_FRAMES_REQUIRED = 5; // Must detect peace sign for 5 consecutive frames
 
     function showGestureFeedback(text) {
       gestureStatus.textContent = text;
@@ -195,73 +194,85 @@
       else setStatusVisible();
     }
 
-    function isFingerExtended(tip, pip, mcp) {
-      // A finger is extended when its tip is above both PIP and MCP joints
-      return tip.y < pip.y && tip.y < mcp.y;
-    }
-
-    function isFingerFolded(tip, pip, mcp) {
-      // A finger is folded when its tip is below both PIP and MCP joints
-      return tip.y > pip.y && tip.y > mcp.y;
-    }
-
     function isPeaceSign(landmarks) {
-      const indexTip = landmarks[8];
-      const indexPip = landmarks[6];
-      const indexMcp = landmarks[5];
-      const middleTip = landmarks[12];
-      const middlePip = landmarks[10];
-      const middleMcp = landmarks[9];
-      const ringTip = landmarks[16];
-      const ringPip = landmarks[14];
-      const ringMcp = landmarks[13];
-      const pinkyTip = landmarks[20];
-      const pinkyPip = landmarks[18];
-      const pinkyMcp = landmarks[17];
+      const wrist = landmarks[0];
       const thumbTip = landmarks[4];
       const thumbIp = landmarks[3];
       const thumbMcp = landmarks[2];
-      const wrist = landmarks[0];
+      const thumbCmc = landmarks[1];
+      const indexTip = landmarks[8];
+      const indexDip = landmarks[7];
+      const indexPip = landmarks[6];
+      const indexMcp = landmarks[5];
+      const middleTip = landmarks[12];
+      const middleDip = landmarks[11];
+      const middlePip = landmarks[10];
+      const middleMcp = landmarks[9];
+      const ringTip = landmarks[16];
+      const ringDip = landmarks[15];
+      const ringPip = landmarks[14];
+      const ringMcp = landmarks[13];
+      const pinkyTip = landmarks[20];
+      const pinkyDip = landmarks[19];
+      const pinkyPip = landmarks[18];
+      const pinkyMcp = landmarks[17];
 
-      // Only index and middle must be fully extended
-      const indexUp = isFingerExtended(indexTip, indexPip, indexMcp);
-      const middleUp = isFingerExtended(middleTip, middlePip, middleMcp);
+      // Helper: finger extension ratio (how far tip is from MCP relative to finger length)
+      function extensionRatio(tip, pip, mcp) {
+        const fingerLen = Math.hypot(mcp.x - pip.x, mcp.y - pip.y) + Math.hypot(pip.x - tip.x, pip.y - tip.y);
+        const direct = Math.hypot(mcp.x - tip.x, mcp.y - tip.y);
+        return fingerLen > 0 ? direct / fingerLen : 0;
+      }
 
-      // Ring, pinky, and thumb must be clearly folded
-      const ringDown = isFingerFolded(ringTip, ringPip, ringMcp);
-      const pinkyDown = isFingerFolded(pinkyTip, pinkyPip, pinkyMcp);
-      const thumbDown = isFingerFolded(thumbTip, thumbIp, thumbMcp);
+      // ===== 1. INDEX finger must be clearly extended upward =====
+      const indexExtended = indexTip.y < indexPip.y - 0.015;
+      const indexStraight = extensionRatio(indexTip, indexPip, indexMcp) > 0.65;
 
-      // Both extended fingers must be the topmost points of the hand
-      const highestY = Math.min(
-        indexTip.y, middleTip.y, ringTip.y, pinkyTip.y, thumbTip.y
-      );
-      const fingersOnTop = highestY === indexTip.y || highestY === middleTip.y;
+      // ===== 2. MIDDLE finger must be clearly extended upward =====
+      const middleExtended = middleTip.y < middlePip.y - 0.015;
+      const middleStraight = extensionRatio(middleTip, middlePip, middleMcp) > 0.65;
 
-      // V angle: index and middle tips should diverge outward from the MCPs
-      const dxTip = middleTip.x - indexTip.x;
-      const dyTip = middleTip.y - indexTip.y;
-      const dxMcp = middleMcp.x - indexMcp.x;
-      const dyMcp = middleMcp.y - indexMcp.y;
-      const dot = dxTip * dxMcp + dyTip * dyMcp;
-      const lenTip = Math.hypot(dxTip, dyTip) + 1e-6;
-      const lenMcp = Math.hypot(dxMcp, dyMcp) + 1e-6;
-      // Angle between the finger-opening direction and the MCP-base direction
-      // For a real V, they should point away from each other (dot small/negative)
-      const vShape = dot / (lenTip * lenMcp) < 0.6;
+      // ===== 3. RING finger must be clearly curled/folded =====
+      const ringCurled = ringTip.y > ringPip.y + 0.01;
+      const ringBent = extensionRatio(ringTip, ringPip, ringMcp) < 0.75;
 
-      // Minimum spread between the two finger tips
+      // ===== 4. PINKY finger must be clearly curled/folded =====
+      const pinkyCurled = pinkyTip.y > pinkyPip.y + 0.01;
+      const pinkyBent = extensionRatio(pinkyTip, pinkyPip, pinkyMcp) < 0.75;
+
+      // ===== 5. THUMB must be folded/tucked, not sticking out =====
+      const thumbTipCloseToPalm = Math.hypot(thumbTip.x - thumbMcp.x, thumbTip.y - thumbMcp.y) < 0.12;
+      const thumbNotExtendedOut = Math.abs(thumbTip.x - thumbIp.x) < 0.06;
+      const thumbTucked = (thumbTip.y > thumbIp.y || thumbTipCloseToPalm) && thumbNotExtendedOut;
+
+      // ===== 6. V-SPREAD: index and middle tips must be spread apart =====
+      // but not too far (not a full open hand)
       const spread = Math.hypot(indexTip.x - middleTip.x, indexTip.y - middleTip.y);
-      const spreadEnough = spread > 0.045;
+      const spreadGood = spread > 0.04 && spread < 0.18;
 
-      // The two extended fingers must point upward (above wrist)
-      const indexAboveWrist = indexTip.y < wrist.y;
-      const middleAboveWrist = middleTip.y < wrist.y;
+      // ===== 7. Index and middle should point upward (not sideways) =====
+      const indexAngle = Math.atan2(indexMcp.y - indexTip.y, indexTip.x - indexMcp.x);
+      const middleAngle = Math.atan2(middleMcp.y - middleTip.y, middleTip.x - middleMcp.x);
+      // Both should be roughly pointing up (angle near PI/2 = 1.57)
+      const indexPointingUp = indexTip.y < indexMcp.y - 0.02;
+      const middlePointingUp = middleTip.y < middleMcp.y - 0.02;
 
-      return indexUp && middleUp &&
-             ringDown && pinkyDown && thumbDown &&
-             fingersOnTop && vShape && spreadEnough &&
-             indexAboveWrist && middleAboveWrist;
+      // ===== 8. Ring and pinky tips should be BELOW index and middle PIPs =====
+      // (ensures they are really folded down, not just slightly bent)
+      const ringClearlyDown = ringTip.y > indexPip.y;
+      const pinkyClearlyDown = pinkyTip.y > middlePip.y;
+
+      // ===== FINAL: ALL conditions must pass =====
+      return (
+        indexExtended && indexStraight &&
+        middleExtended && middleStraight &&
+        ringCurled && ringBent &&
+        pinkyCurled && pinkyBent &&
+        thumbTucked &&
+        spreadGood &&
+        indexPointingUp && middlePointingUp &&
+        ringClearlyDown && pinkyClearlyDown
+      );
     }
 
     gotItBtn.addEventListener('click', () => {
@@ -363,8 +374,8 @@
     hands.setOptions({
       maxNumHands: 1,
       modelComplexity: 1,
-      minDetectionConfidence: 0.7,
-      minTrackingConfidence: 0.7
+      minDetectionConfidence: 0.8,
+      minTrackingConfidence: 0.8
     });
 
     hands.onResults((results) => {
@@ -385,33 +396,21 @@
         const landmarks = results.multiHandLandmarks[0];
 
         if (isPeaceSign(landmarks)) {
-          if (!peaceSignActive) {
-            // Peace sign just appeared
-            peaceSignActive = true;
-            peaceSignTriggered = false;
-            peaceFrames = 0;
-          }
-
-          if (!peaceSignTriggered) {
-            peaceFrames++;
-            if (peaceFrames >= PEACE_HOLD_FRAMES) {
-              peaceSignTriggered = true;
-              peaceFrames = 0;
-              showGestureFeedback('Peace sign detected');
-              toggleInvisibility();
-            }
+          peaceFrameCount++;
+          if (peaceFrameCount >= PEACE_FRAMES_REQUIRED && !isGesturing) {
+            isGesturing = true;
+            showGestureFeedback('Peace sign detected');
+            toggleInvisibility();
+            peaceFrameCount = 0;
+            setTimeout(() => {
+              isGesturing = false;
+            }, 2000);
           }
         } else {
-          // Hand present but not a peace sign: reset everything
-          peaceSignActive = false;
-          peaceSignTriggered = false;
-          peaceFrames = 0;
+          peaceFrameCount = 0; // Reset if gesture breaks
         }
       } else {
-        // No hand detected: reset
-        peaceSignActive = false;
-        peaceSignTriggered = false;
-        peaceFrames = 0;
+        peaceFrameCount = 0; // No hand detected, reset
       }
     });
 
@@ -462,5 +461,6 @@
     populateCameraList().then(() => startCamera());
   </script>
 <script defer src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"1954b47c125f43f8b4338b3c4f804e4f","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
-<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a14c0938fcba2154',t:'MTc4Mjk3ODM3OQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"1954b47c125f43f8b4338b3c4f804e4f","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+</body>
 </html>
