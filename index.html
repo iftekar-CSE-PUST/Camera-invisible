@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Air Gesture Invisibility Camera - OBS Friendly</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #111;
+      color: #fff;
+      font-family: Segoe UI, Tahoma, Geneva, Verdana, sans-serif;
+    }
+
+    #container {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    #video {
+      display: none;
+    }
+
+    #canvas {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+      background: #000;
+    }
+
+    /* কোনো লেখা / ব্যাজ / বাটন ক্যামেরার উপর দেখা যাবে না।
+       শুধু ক্যামেরা চালু করা যায়নি এমন সমস্যার ক্ষেত্রে error overlay দেখাবে,
+       কারণ সেটা ছাড়া সমস্যা বোঝা সম্ভব না। */
+    .panel {
+      background: rgba(0,0,0,0.82);
+      border: 1px solid rgba(0,255,204,0.35);
+      border-radius: 14px;
+      box-shadow: 0 8px 28px rgba(0,0,0,0.35);
+      backdrop-filter: blur(10px);
+    }
+
+    #error-overlay {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      width: min(92vw, 640px);
+      z-index: 20;
+      box-sizing: border-box;
+    }
+
+    #error-overlay h2 {
+      margin-top: 0;
+      color: #00ffcc;
+    }
+
+    #error-overlay p,
+    #error-overlay li {
+      line-height: 1.5;
+      color: #eee;
+    }
+
+    #error-card {
+      padding: 24px;
+      text-align: center;
+      border-color: rgba(255,120,120,0.45);
+    }
+
+    #error-list {
+      text-align: left;
+      margin: 12px 0 0;
+      padding-left: 20px;
+    }
+
+    select,
+    button {
+      border: none;
+      border-radius: 999px;
+      padding: 10px 16px;
+      font-size: 0.95rem;
+      background: #00ffcc;
+      color: #000;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .hide {
+      display: none !important;
+    }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
+
+    <div id="error-overlay" class="hide">
+      <div id="error-card" class="panel">
+        <h2>ক্যামেরা চালু হয়নি</h2>
+        <p id="error-text">Camera access পাওয়া যায়নি।</p>
+        <ul id="error-list">
+          <li>OBS Browser Source হলে Local File এর বদলে <strong>http://localhost</strong> URL ব্যবহার করুন</li>
+          <li>OBS চালুর সময় <strong>--use-fake-ui-for-media-stream</strong> flag ব্যবহার করুন</li>
+          <li>Windows/Mac privacy settings থেকে OBS-কে Camera permission দিন</li>
+          <li>অথবা ফাইলটি Chrome-এ খুলে Window Capture দিয়ে OBS-এ নিন</li>
+        </ul>
+        <div style="margin-top:16px; display:flex; gap:10px; justify-content:center; flex-wrap:wrap;">
+          <button id="retry-btn">আবার চেষ্টা করুন</button>
+          <button id="dismiss-error-btn">বন্ধ করুন</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+    const errorOverlay = document.getElementById('error-overlay');
+    const errorText = document.getElementById('error-text');
+    const retryBtn = document.getElementById('retry-btn');
+    const dismissErrorBtn = document.getElementById('dismiss-error-btn');
+
+    let isInvisible = false;
+    let backgroundFrame = null;
+    let isGesturing = false;
+    let lastVideoWidth = 1280;
+    let lastVideoHeight = 720;
+    let mediaStream = null;
+    let processLoopRunning = false;
+    let handSendBusy = false;
+
+    function showError(message) {
+      errorText.textContent = message;
+      errorOverlay.classList.remove('hide');
+    }
+
+    function hideError() {
+      errorOverlay.classList.add('hide');
+    }
+
+    function fitCanvasToVideo() {
+      if (video.videoWidth && video.videoHeight) {
+        lastVideoWidth = video.videoWidth;
+        lastVideoHeight = video.videoHeight;
+      }
+      canvas.width = lastVideoWidth;
+      canvas.height = lastVideoHeight;
+    }
+
+    function captureBackground() {
+      if (!video.videoWidth || !video.videoHeight) {
+        return false;
+      }
+      fitCanvasToVideo();
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      backgroundFrame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      return true;
+    }
+
+    function toggleInvisibility() {
+      if (!backgroundFrame) {
+        captureBackground();
+      }
+      isInvisible = !isInvisible;
+    }
+
+    retryBtn.addEventListener('click', () => {
+      hideError();
+      startCamera();
+    });
+
+    dismissErrorBtn.addEventListener('click', hideError);
+
+    async function stopCurrentStream() {
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+      }
+      video.srcObject = null;
+    }
+
+    async function startCamera() {
+      try {
+        hideError();
+
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          showError('এই পরিবেশে getUserMedia / camera API পাওয়া যাচ্ছে না।');
+          return;
+        }
+
+        await stopCurrentStream();
+
+        const videoConstraints = { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' };
+
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          video: videoConstraints,
+          audio: false
+        });
+
+        video.srcObject = mediaStream;
+        await video.play();
+        fitCanvasToVideo();
+
+        if (!processLoopRunning) {
+          processLoopRunning = true;
+          processFrames();
+        }
+      } catch (err) {
+        console.error(err);
+        const name = err && err.name ? err.name : 'Error';
+        let message = 'Camera access পাওয়া যায়নি।';
+        if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+          message = 'Camera permission denied হয়েছে।';
+        } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+          message = 'কোনো camera device পাওয়া যায়নি।';
+        } else if (name === 'NotReadableError' || name === 'TrackStartError') {
+          message = 'Camera অন্য app/OBS source already ব্যবহার করছে।';
+        } else if (name === 'OverconstrainedError') {
+          message = 'ক্যামেরা source start করা যায়নি।';
+        }
+        showError(message);
+      }
+    }
+
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.7,
+      minTrackingConfidence: 0.7
+    });
+
+    hands.onResults((results) => {
+      if (results.image) {
+        canvas.width = results.image.width;
+        canvas.height = results.image.height;
+        lastVideoWidth = canvas.width;
+        lastVideoHeight = canvas.height;
+      }
+
+      if (isInvisible && backgroundFrame) {
+        ctx.putImageData(backgroundFrame, 0, 0);
+      } else if (results.image) {
+        ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+      }
+
+      // হাতের landmark ঠিকমতো detect ও track হচ্ছে, শুধু dot গুলো ক্যানভাসে আঁকা হচ্ছে না।
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        const landmarks = results.multiHandLandmarks[0];
+        const indexUp = landmarks[8].y < landmarks[6].y;
+        const middleUp = landmarks[12].y < landmarks[10].y;
+        const ringDown = landmarks[16].y > landmarks[14].y;
+        const pinkyDown = landmarks[20].y > landmarks[18].y;
+
+        if (indexUp && middleUp && ringDown && pinkyDown) {
+          if (!isGesturing) {
+            isGesturing = true;
+            toggleInvisibility();
+            setTimeout(() => {
+              isGesturing = false;
+            }, 2500);
+          }
+        }
+      }
+    });
+
+    async function processFrames() {
+      if (video.readyState >= 2 && !handSendBusy) {
+        try {
+          handSendBusy = true;
+          await hands.send({ image: video });
+        } catch (err) {
+          console.error('MediaPipe processing error:', err);
+        } finally {
+          handSendBusy = false;
+        }
+      }
+      requestAnimationFrame(processFrames);
+    }
+
+    // Space চাপলে ম্যানুয়ালি background capture হবে (auto-capture বন্ধ)
+    document.addEventListener('keydown', (e) => {
+      if (e.code === 'Space' || e.key === ' ') {
+        e.preventDefault();
+        captureBackground();
+      }
+    });
+
+    startCamera();
+  </script>
+</body>
+</html>
